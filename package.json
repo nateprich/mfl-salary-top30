@@ -1,0 +1,12 @@
+{
+  "name": "mfl-salary-top30",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node export-salaries.mjs"
+  },
+  "dependencies": {
+    "xlsx-js-style": "^1.2.0"
+  }
+}
