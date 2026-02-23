@@ -324,7 +324,7 @@ const HEADER_FONT = { bold: true, color: { rgb: 'FFFFFF' }, sz: 11 };
 const SUBHEADER_FILL = { fgColor: { rgb: 'E2E8F0' } };
 const SUBHEADER_FONT = { bold: true, sz: 10 };
 const EVEN_ROW_FILL = { fgColor: { rgb: 'F7FAFC' } };
-const CURRENCY_FMT = '$#,##0';
+const CURRENCY_FMT = '$#,##0.00';
 const CENTER = { horizontal: 'center', vertical: 'center' };
 const LEFT = { horizontal: 'left', vertical: 'center' };
 const RIGHT = { horizontal: 'right', vertical: 'center' };
@@ -400,7 +400,7 @@ function buildPositionSheet(positionData) {
       const salaryStyle = { numFmt: CURRENCY_FMT, alignment: RIGHT };
       if (rowFill) salaryStyle.fill = rowFill;
       ws[XLSX.utils.encode_cell({ r: excelRow, c: col + 1 })] = player
-        ? cell(Math.round(player.salary), 'n', salaryStyle)
+        ? cell(player.salary, 'n', salaryStyle)
         : cell('', 's', rowFill ? { fill: rowFill } : {});
     }
   }
