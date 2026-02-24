@@ -6,15 +6,15 @@
  * seasons 2021-2025 and exports the top 30 salaries per position to
  * an Excel workbook.
  *
- * Data sources per year (four sources, merged with max salary per player):
- *   1. Week 1 rosters — carry-over contracts from previous years
- *   2. Week 14 rosters — mid-season state with carry-over contracts
- *   3. Auction results — authoritative winning bids for newly-auctioned players
- *      (the roster salary field does NOT reliably reflect auction bids)
- *   4. BBID_WAIVER transactions — mid-season waiver claims with exact bid amounts
+ * Data sources:
+ *   - Historical auction results (2017-2025) — original winning bids
+ *   - Historical BBID waiver transactions (2017-2025) — mid-season claim bids
+ *   - Week 1 & Week 14 rosters — contractYear field for escalation calculation
+ *   - Player metadata — names and positions
  *
- * Together these capture every player who held a salary at any point
- * during the season, including players who were later dropped.
+ * Salary escalation: Multi-year contracts escalate at 10% per year.
+ *   Formula: originalBid × 1.10^(contractYear - 1)
+ *   e.g. $13,050,000 auction in Year 1 → $14,355,000 Year 2 → $15,790,500 Year 3
  */
 
 import XLSX from 'xlsx-js-style';
@@ -29,6 +29,7 @@ const TOP_N = 30;
 const REQUEST_DELAY_MS = 1000;
 const MAX_RETRIES = 3;
 const RETRY_BACKOFF_MS = 1500;
+const HISTORICAL_START = 2017; // Need auction/BBID data back to 2017 for 5-year contracts
 
 // Team-aggregate positions to exclude from output
 const EXCLUDED_POSITIONS = new Set([
@@ -74,13 +75,39 @@ function normalizePosition(pos) {
 }
 
 /**
- * Merge a salary map into an accumulator, keeping the max salary per player.
+ * Calculate the escalated salary for a rostered player.
+ *
+ * Searches backwards through historical auction and BBID data to find
+ * when the player was originally acquired, then applies 10% annual escalation
+ * based on how many years have elapsed since acquisition.
+ *
+ * Note: MFL's contractYear field means "years remaining" (counts down),
+ * NOT "which year of the contract". So we search backwards instead.
+ *
+ * @param {string} playerId - MFL player ID
+ * @param {number} targetYear - The season year being processed
+ * @param {Object} auctionsByYear - { year: Map<playerId, winningBid> }
+ * @param {Object} bbidsByYear - { year: Map<playerId, bidAmount> }
+ * @returns {number} Escalated salary, or 0 if original bid not found
  */
-function mergeInto(target, source) {
-  for (const [playerId, salary] of source) {
-    const existing = target.get(playerId) || 0;
-    target.set(playerId, Math.max(existing, salary));
+function calculateEscalatedSalary(playerId, targetYear, auctionsByYear, bbidsByYear) {
+  // Search backwards from targetYear to find the most recent acquisition.
+  // Max contract is 5 years, so don't look back further than that.
+  const searchEnd = Math.max(targetYear - 4, HISTORICAL_START);
+
+  for (let y = targetYear; y >= searchEnd; y--) {
+    const auctionBid = auctionsByYear[y]?.get(playerId) || 0;
+    const bbidBid = bbidsByYear[y]?.get(playerId) || 0;
+    const originalBid = Math.max(auctionBid, bbidBid);
+
+    if (originalBid > 0) {
+      const yearsElapsed = targetYear - y;
+      // Apply 10% annual escalation: baseSalary × 1.10^yearsElapsed
+      return Math.round(originalBid * Math.pow(1.10, yearsElapsed));
+    }
   }
+
+  return 0; // Original bid not found — caller should fall back to roster salary
 }
 
 // ── API Layer ────────────────────────────────────────────────────────
@@ -118,28 +145,31 @@ function buildUrl(year, params) {
 
 /**
  * Fetch rosters for a given year and week.
- * Returns Map<playerId, salary>.
+ * Returns Map<playerId, { salary, contractYear }>.
  */
 async function fetchRosters(year, week) {
   const url = buildUrl(year, { TYPE: 'rosters', W: String(week) });
   console.log(`  Rosters (W${week}):  ${url}`);
   const data = await fetchJson(url);
 
-  const salaryMap = new Map();
+  const rosterMap = new Map();
   const franchises = ensureArray(data?.rosters?.franchise);
   for (const franchise of franchises) {
     const players = ensureArray(franchise?.player);
     for (const p of players) {
       if (!p?.id) continue;
       const salary = parseFloat(p.salary) || 0;
-      if (salary > 0) {
-        const existing = salaryMap.get(p.id) || 0;
-        salaryMap.set(p.id, Math.max(existing, salary));
+      const contractYear = parseInt(p.contractYear, 10) || 0;
+      if (salary > 0 || contractYear > 0) {
+        const existing = rosterMap.get(p.id);
+        if (!existing || salary > existing.salary) {
+          rosterMap.set(p.id, { salary, contractYear });
+        }
       }
     }
   }
 
-  return salaryMap;
+  return rosterMap;
 }
 
 /**
@@ -261,7 +291,14 @@ function rankByPosition(salaryMap, playerMap) {
 }
 
 /**
- * Process all years: fetch four sources, merge, rank.
+ * Process all years with salary escalation.
+ *
+ * Phase 1: Fetch historical auction + BBID data (2017-2025) to look up
+ *          original acquisition bids for multi-year contract escalation.
+ *
+ * Phase 2: For each target year, fetch rosters with contractYear, calculate
+ *          escalated salaries, and merge with current-year auction/BBID bids.
+ *
  * Returns { position: { year: [ { name, salary }, ... ] } }
  */
 async function collectAllData() {
@@ -270,40 +307,80 @@ async function collectAllData() {
     allData[pos] = {};
   }
 
+  const lastYear = YEARS[YEARS.length - 1];
+
+  // ── Phase 1: Fetch all historical auction + BBID data ──
+  console.log(`\n${'='.repeat(60)}`);
+  console.log(`Phase 1: Fetching historical auction & BBID data (${HISTORICAL_START}-${lastYear})...`);
+
+  const auctionsByYear = {};
+  const bbidsByYear = {};
+
+  for (let y = HISTORICAL_START; y <= lastYear; y++) {
+    console.log(`  ${y}:`);
+    auctionsByYear[y] = await fetchAuctionResults(y);
+    await delay(REQUEST_DELAY_MS);
+    bbidsByYear[y] = await fetchBbidTransactions(y);
+    await delay(REQUEST_DELAY_MS);
+    console.log(`    Auction: ${auctionsByYear[y].size} | BBID: ${bbidsByYear[y].size}`);
+  }
+
+  // ── Phase 2: Process each target year ──
   for (const year of YEARS) {
     console.log(`\n${'='.repeat(60)}`);
-    console.log(`Fetching ${year}...`);
+    console.log(`Phase 2: Processing ${year} (with 10% escalation)...`);
 
-    // Source 1: Week 1 rosters (carry-over contracts, dropped players)
+    // Fetch rosters (with contractYear) and player metadata
     const rostersW1 = await fetchRosters(year, 1);
     await delay(REQUEST_DELAY_MS);
-
-    // Source 2: Week 14 rosters (mid-season state)
     const rostersW14 = await fetchRosters(year, 14);
     await delay(REQUEST_DELAY_MS);
-
-    // Source 3: Auction results (authoritative for newly-auctioned salaries)
-    const auctionSalaries = await fetchAuctionResults(year);
-    await delay(REQUEST_DELAY_MS);
-
-    // Source 4: BBID waiver transactions (mid-season claims)
-    const bbidSalaries = await fetchBbidTransactions(year);
-    await delay(REQUEST_DELAY_MS);
-
-    // Source 5: Player metadata (names + positions)
     const playerMap = await fetchPlayerMetadata(year);
     await delay(REQUEST_DELAY_MS);
 
-    // Merge all four salary sources (max salary per player)
+    // Build merged salary map with escalation
     const merged = new Map();
-    mergeInto(merged, rostersW1);
-    mergeInto(merged, rostersW14);
-    mergeInto(merged, auctionSalaries);
-    mergeInto(merged, bbidSalaries);
+
+    // Process both roster snapshots — calculate escalated salary for each player
+    for (const roster of [rostersW1, rostersW14]) {
+      for (const [playerId, info] of roster) {
+        const escalated = calculateEscalatedSalary(
+          playerId, year, auctionsByYear, bbidsByYear
+        );
+
+        // Use escalated salary if we found the original bid, otherwise fall back
+        // to the roster salary field (may be unreliable but it's the best we have)
+        const salary = escalated > 0 ? escalated : info.salary;
+
+        const existing = merged.get(playerId) || 0;
+        if (salary > existing) {
+          merged.set(playerId, salary);
+        }
+      }
+    }
+
+    // Include current year's auction results for players not on any roster
+    // (e.g. dropped before Week 1). These are Year 1 bids — no escalation.
+    const currentAuctions = auctionsByYear[year] || new Map();
+    for (const [playerId, bid] of currentAuctions) {
+      const existing = merged.get(playerId) || 0;
+      if (bid > existing) {
+        merged.set(playerId, bid);
+      }
+    }
+
+    // Include current year's BBID claims not already captured
+    const currentBbids = bbidsByYear[year] || new Map();
+    for (const [playerId, bid] of currentBbids) {
+      const existing = merged.get(playerId) || 0;
+      if (bid > existing) {
+        merged.set(playerId, bid);
+      }
+    }
 
     const ranked = rankByPosition(merged, playerMap);
 
-    console.log(`  W1: ${rostersW1.size} | W14: ${rostersW14.size} | Auction: ${auctionSalaries.size} | BBID: ${bbidSalaries.size} | Merged: ${merged.size}`);
+    console.log(`  W1: ${rostersW1.size} | W14: ${rostersW14.size} | Auction: ${currentAuctions.size} | BBID: ${currentBbids.size} | Merged: ${merged.size}`);
     for (const pos of POSITIONS) {
       console.log(`    ${pos.padEnd(4)} top ${ranked[pos].length}`);
     }
@@ -433,9 +510,10 @@ function createWorkbook(allData) {
 // ── Main ─────────────────────────────────────────────────────────────
 
 async function main() {
-  console.log('MFL Salary Top 30 Exporter');
+  console.log('MFL Salary Top 30 Exporter (with 10% escalation)');
   console.log(`League: ${LEAGUE_ID} | Years: ${YEARS.join(', ')} | Positions: ${POSITIONS.join(', ')}`);
-  console.log('Sources: W1 Rosters + W14 Rosters + Auction Results + BBID Waivers');
+  console.log(`Historical data: ${HISTORICAL_START}-${YEARS[YEARS.length - 1]} (auction + BBID)`);
+  console.log('Escalation: originalBid × 1.10^(contractYear - 1)');
 
   try {
     const allData = await collectAllData();
